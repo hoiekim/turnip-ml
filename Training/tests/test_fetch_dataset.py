@@ -244,6 +244,7 @@ class BuildTest(FetchTestCase):
                 "taxonomy_version": 2,
                 "unmapped_tokens": 1,
                 "cache_pruned": 0,
+                "holdout_field_rows": 0,
             },
         )
         a = self.sample(SRC_A)
@@ -761,6 +762,52 @@ class HoldoutFlagTest(FetchTestCase):
         self.build(FakeExport(explicit), out="explicit")
         self.assertEqual(self.tree("dataset"), self.tree("explicit"))
         self.assertFalse(any(m["holdout"] for m in self.manifest()))
+
+    def test_the_build_counts_the_rows_that_carry_the_field(self):
+        self.assertEqual(self.build()["holdout_field_rows"], 0)
+        explicit = [{**r, "holdout": False} for r in ROWS]
+        stats = self.build(FakeExport(explicit), out="explicit")
+        self.assertEqual(stats["holdout_field_rows"], len(ROWS))
+        flagged = [
+            {**r, "holdout": True} if r["source_id"] == SRC_C else r for r in ROWS
+        ]
+        stats = self.build(FakeExport(flagged), out="flagged")
+        self.assertEqual(stats["holdout_field_rows"], 1)  # SRC_C's one row
+
+    def main_build(self, rows):
+        argv = [
+            "build",
+            "--out",
+            str(self.root / "dataset"),
+            "--cache",
+            str(self.cache),
+        ]
+        code = fetch_dataset.main(
+            argv, transport=FakeExport(rows), blob_getter=self.blobs
+        )
+        self.assertEqual(code, EXIT_OK)  # a warning, not an error
+        return json.loads(self.stdout.getvalue()), self.stderr.getvalue()
+
+    def test_no_flagged_source_warns_that_the_export_lacks_the_field(self):
+        stats, err = self.main_build(ROWS)
+        self.assertEqual(
+            (stats["holdout_samples"], stats["holdout_field_rows"]), (0, 0)
+        )
+        self.assertIn("warning: no source is flagged holdout", err)
+        self.assertIn("none of the 6 export rows carries the holdout field", err)
+
+    def test_no_flagged_source_warns_that_nothing_is_flagged(self):
+        stats, err = self.main_build([{**r, "holdout": False} for r in ROWS])
+        self.assertEqual(
+            (stats["holdout_samples"], stats["holdout_field_rows"]), (0, 6)
+        )
+        self.assertIn("6 of the 6 export rows carry the holdout field, none true", err)
+
+    def test_a_flagged_source_gives_no_warning(self):
+        rows = [{**r, "holdout": True} if r["source_id"] == SRC_A else r for r in ROWS]
+        stats, err = self.main_build(rows)
+        self.assertEqual(stats["holdout_samples"], 1)
+        self.assertEqual(err, "")
 
     def test_the_manifest_splits_with_the_flagged_source_in_holdout(self):
         rows = [{**r, "holdout": True} if r["source_id"] == SRC_B else r for r in ROWS]

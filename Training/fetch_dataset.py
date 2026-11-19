@@ -74,6 +74,11 @@ the holdout split, which is never trained on. A missing field means
 false. Anything but a boolean is malformed, and so are rows of one
 source that disagree about it: the flag belongs to the source, and a
 split cannot honor half of one.
+A missing flag and false build the same dataset, so only the build's
+stdout tells them apart: `holdout_field_rows` counts the rows that
+carried the field. With no flagged source, a warning on stderr says
+which case it was: no row carried the field (an export from before it),
+or rows carried it and none is true (no curated footage flagged).
 
 Rare-trick hold-back
 --------------------
@@ -247,6 +252,9 @@ class ExportPull:
     # The farm's hold-back threshold; None when a page lacked it, which
     # holds every trick back.
     contributor_minimum: int | None
+    # Rows that carried the holdout field at all, true or false: 0 means an
+    # export from before the field (module docstring, "Holdout flag").
+    holdout_field_rows: int
 
 
 # -- export ------------------------------------------------------------------
@@ -503,6 +511,7 @@ class ExportClient:
         taxonomy: set[tuple[str, str, int]] = set()
         counts: list[dict[str, int]] = []
         minimums: list[int | None] = []
+        holdout_field_rows = 0
         cursor = since
         seen: set[str | None] = {since}
         while True:
@@ -526,6 +535,8 @@ class ExportClient:
                 )
             offset = len(rows)
             rows.extend(parse_row(offset + i, r) for i, r in enumerate(page["rows"]))
+            # parse_row has checked every row is an object.
+            holdout_field_rows += sum(HOLDOUT_FIELD in r for r in page["rows"])
             taxonomy.update(parse_taxonomy(i, t) for i, t in enumerate(page_taxonomy))
             counts.append(parse_contributor_counts(page))
             minimums.append(parse_contributor_minimum(page))
@@ -537,7 +548,14 @@ class ExportClient:
             cursor = next_cursor
         known = [m for m in minimums if m is not None]
         minimum = max(known) if known and len(known) == len(minimums) else None
-        return ExportPull(rows, sorted(taxonomy), cursor, _min_counts(counts), minimum)
+        return ExportPull(
+            rows,
+            sorted(taxonomy),
+            cursor,
+            _min_counts(counts),
+            minimum,
+            holdout_field_rows,
+        )
 
 
 # -- pose blobs ----------------------------------------------------------------
@@ -738,8 +756,34 @@ def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str
         # Gone after a successful rename; otherwise never leave a partial
         # dataset behind.
         shutil.rmtree(staging, ignore_errors=True)
-    # Not in dataset_manifest.json: it describes this cache, not the data.
-    return {**stats, "cache_pruned": pruned}
+    # Not in dataset_manifest.json: they describe this cache and this
+    # export, not the data (a missing holdout flag and false build the same
+    # dataset).
+    return {
+        **stats,
+        "cache_pruned": pruned,
+        "holdout_field_rows": pull.holdout_field_rows,
+    }
+
+
+def no_holdout_warning(stats: dict[str, Any]) -> str:
+    """Why a built dataset has no holdout source: the export never sent
+    the field, or sent it with no row true."""
+    rows, carried = stats["label_rows"], stats["holdout_field_rows"]
+    if carried == 0:
+        cause = (
+            f"none of the {rows} export rows carries the holdout field "
+            "(an export from before the field)"
+        )
+    else:
+        cause = (
+            f"{carried} of the {rows} export rows carry the holdout field, "
+            "none true (the farm flags no curated footage)"
+        )
+    return (
+        f"no source is flagged holdout: {cause}; "
+        "split_dataset.py --require-holdout refuses this dataset"
+    )
 
 
 def _write_dataset(
@@ -966,6 +1010,9 @@ def main(
         else:
             blobs = BlobCache(args.cache, blob_getter or r2_getter_from_env())
             result = build_dataset(client.pull(), blobs, args.out)
+            if result["holdout_samples"] == 0:
+                warning = no_holdout_warning(result)
+                print(f"fetch_dataset: warning: {warning}", file=sys.stderr)
     except FetchError as e:
         print(f"fetch_dataset: error: {e}", file=sys.stderr)
         return EXIT_ERROR
